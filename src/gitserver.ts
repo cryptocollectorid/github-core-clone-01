@@ -22,7 +22,7 @@ import {
   type GitObject,
   type ObjType,
 } from './gitobj.ts';
-import { ApiError, branchRefName, type Repo, type Store } from './store.ts';
+import { ApiError, branchRefName, touchRefs, type Repo, type Store } from './store.ts';
 import { GIT_AGENT, ZERO_OID } from './util.ts';
 
 export interface GitResponse {
@@ -135,6 +135,18 @@ interface LsRefsArgs {
 }
 
 function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
+  // The reply is a pure function of the refs + the args (objects are
+  // immutable, so a peeled tag never changes), so memoize it per args.
+  // Every refs mutation clears the cache via touchRefs in store.ts.
+  const key = `${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const cached = repo.lsRefsCache.get(key);
+  if (cached) return cached;
+  const body = buildLsRefs(repo, args);
+  repo.lsRefsCache.set(key, body);
+  return body;
+}
+
+function buildLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
   const lines: Buffer[] = [];
   const tip = defaultTip(repo);
   const headMatches = args.prefixes.length === 0 || args.prefixes.some((p) => 'HEAD'.startsWith(p));
@@ -304,8 +316,12 @@ function selectObjects(repo: Repo, req: FetchRequest): Selection {
     }
   }
   const visited = new Set<string>();
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift()!;
+  // Index pointer, not shift(): shift() is O(n) per pop, so a deep walk
+  // was O(n^2) array moves.
+  let qi = 0;
+  while (qi < queue.length) {
+    const { oid, gen } = queue[qi]!;
+    qi += 1;
     if (visited.has(oid)) continue;
     visited.add(oid);
     const obj = store.get(oid);
@@ -563,6 +579,7 @@ function applyPushCommand(repo: Repo, cmd: PushCommand): string {
     if (!current) return `ng ${ref} remote ref does not exist`;
     if (current !== oldOid) return `ng ${ref} stale info`;
     repo.refs.delete(ref);
+    touchRefs(repo);
     return `ok ${ref}`;
   }
   // The new object must exist after unpacking.
@@ -572,6 +589,7 @@ function applyPushCommand(repo: Repo, cmd: PushCommand): string {
     // Create.
     if (current) return `ng ${ref} already exists`;
     repo.refs.set(ref, newOid);
+    touchRefs(repo);
     return `ok ${ref}`;
   }
   // Update.
@@ -583,6 +601,7 @@ function applyPushCommand(repo: Repo, cmd: PushCommand): string {
     return `ng ${ref} non-fast-forward`;
   }
   repo.refs.set(ref, newOid);
+  touchRefs(repo);
   return `ok ${ref}`;
 }
 

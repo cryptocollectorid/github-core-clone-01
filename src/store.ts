@@ -93,6 +93,11 @@ export interface Repo {
    *  when every oid the request names already exists in the store. */
   fetchCache: Map<string, Buffer>;
   fetchCacheBytes: number;
+  /** Memoized ls-refs replies (the whole response Buffer), keyed by the
+   *  request args. A reply is a pure function of the refs + the args
+   *  (objects are immutable, so a peeled tag never changes); every refs
+   *  mutation clears this map via touchRefs below. */
+  lsRefsCache: Map<string, Buffer>;
 }
 
 export class Store {
@@ -146,6 +151,7 @@ export class Store {
       labels: new Map(),
       fetchCache: new Map(),
       fetchCacheBytes: 0,
+      lsRefsCache: new Map(),
     };
     this.repos.set(key, repo);
     return repo;
@@ -162,6 +168,12 @@ export class Store {
 
 export function branchRefName(repo: Repo, branch: string): string {
   return `refs/heads/${branch}`;
+}
+
+/** Record a refs mutation: invalidates the ls-refs cache. Call after
+ *  every refs.set / refs.delete on the repo. */
+export function touchRefs(repo: Repo): void {
+  repo.lsRefsCache.clear();
 }
 
 export function defaultTip(repo: Repo): string | null {
@@ -397,6 +409,7 @@ export function mergePull(store: Store, repo: Repo, pr: Pull): { sha: string; me
   const { oid: mergeSha, obj } = makeObject('commit', commitData);
   repo.objects.set(mergeSha, obj);
   repo.refs.set(branchRefName(repo, pr.base), mergeSha);
+  touchRefs(repo);
   pr.state = 'closed';
   pr.merged = true;
   pr.mergedAt = isoFromSeq(store.nextSeq());
@@ -453,6 +466,7 @@ export function putContent(
   const { oid: commitSha, obj: commitObj } = makeObject('commit', commitData);
   repo.objects.set(commitSha, commitObj);
   repo.refs.set(refName, commitSha);
+  touchRefs(repo);
   return { blobSha, commitSha, isNew };
 }
 
@@ -484,6 +498,7 @@ export function deleteContent(
   const { oid: commitSha, obj: commitObj } = makeObject('commit', commitData);
   repo.objects.set(commitSha, commitObj);
   repo.refs.set(refName, commitSha);
+  touchRefs(repo);
   return { commitSha };
 }
 

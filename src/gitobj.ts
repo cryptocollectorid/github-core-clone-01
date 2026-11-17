@@ -317,9 +317,14 @@ function adler32(data: Buffer): number {
 /** Find the length of the deflate stream starting at `off` in buf, knowing
  *  its inflated size, and return the inflated data with it. inflateSync
  *  ignores trailing bytes, so one call inflates the first stream; the
- *  stream's end is the position of its Adler-32 trailer (verified by
- *  re-inflating the exact slice). Returning the data with the length
- *  avoids a third inflate of the same stream by the caller. */
+ *  stream's end is the position of its Adler-32 trailer. The returned data
+ *  comes from that one inflate (zlib stops at the stream's end), so it is
+ *  correct whatever the length says — there is deliberately no second
+ *  inflate to "verify" the candidate end (the old code re-inflated the
+ *  exact slice, doubling inflate CPU per object). A coincidental Adler
+ *  match inside the deflate data (~1 in 2^32 per position) only shifts the
+ *  offset: the next object's parse fails on it, or readPack's final
+ *  trailer-offset check does, so nothing wrong is ever stored. */
 function findDeflateEnd(buf: Buffer, off: number, inflatedSize: number): { length: number; data: Buffer } {
   const data = inflateSync(buf.subarray(off));
   if (data.length !== inflatedSize) throw new Error('pack object size mismatch');
@@ -331,14 +336,7 @@ function findDeflateEnd(buf: Buffer, off: number, inflatedSize: number): { lengt
     const idx = buf.indexOf(needle, pos);
     if (idx < 0) throw new Error('deflate stream end not found');
     const len = idx - off + 4;
-    if (len >= 7) {
-      try {
-        const check = inflateSync(buf.subarray(off, off + len));
-        if (check.length === inflatedSize) return { length: len, data };
-      } catch {
-        // Not the true end (a coincidental match inside the deflate data).
-      }
-    }
+    if (len >= 7) return { length: len, data };
     pos = idx + 1;
   }
 }
@@ -447,6 +445,10 @@ export function readPack(buf: Buffer, known?: Map<string, GitObject>): Map<strin
       byOid.set(oid, entry);
     }
   }
+  // A pack is exactly header + objects + 20-byte trailer. A wrong stream
+  // length lands `off` anywhere else, so this turns a mis-parse into a
+  // loud failure instead of storing wrong objects.
+  if (off !== buf.length - 20) throw new Error('pack size mismatch');
   // Resolve deltas (bases may appear later in the pack for REF_DELTA).
   for (let round = 0; round < pending.length + 2 && pending.length > 0; round++) {
     const still: typeof pending = [];
@@ -548,8 +550,12 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
   const bAnc = commitAncestors(store, b);
   const queue: string[] = [a];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  // Index pointer, not shift(): shift() is O(n) per pop, so a deep walk
+  // was O(n^2) array moves.
+  let qi = 0;
+  while (qi < queue.length) {
+    const oid = queue[qi]!;
+    qi += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (bAnc.has(oid)) return oid;

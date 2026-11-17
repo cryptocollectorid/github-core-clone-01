@@ -21,6 +21,7 @@ import {
   putContent,
   repoJson,
   resolveRef,
+  touchRefs,
   type Repo,
   type Store,
 } from './store.ts';
@@ -253,6 +254,7 @@ function route(store: Store, req: RestRequest): RestResponse {
     }
     if (repo.refs.has(ref)) throw new ApiError(422, 'Validation Failed: reference already exists.');
     repo.refs.set(ref, sha);
+    touchRefs(repo);
     return json(201, { ref, object: { sha, type: 'commit' } }, scopes);
   }
 
