@@ -70,16 +70,19 @@ function peelToCommit(repo: Repo, oid: string): string | null {
 // ---------------------------------------------------------------------------
 
 function advertisementV2(): Buffer {
-  const lines = [
-    encodePktLine('version 2\n'),
-    encodePktLine(`agent=${GIT_AGENT}\n`),
-    encodePktLine('ls-refs=unborn\n'),
-    encodePktLine('fetch=shallow filter\n'),
-    encodePktLine('object-format=sha1\n'),
-    FLUSH,
-  ];
-  return Buffer.concat(lines);
+  return ADVERTISEMENT_V2;
 }
+
+/** The v2 capability advertisement never changes (no repository state in
+ *  it), so it is built once and reused. */
+const ADVERTISEMENT_V2: Buffer = Buffer.concat([
+  encodePktLine('version 2\n'),
+  encodePktLine(`agent=${GIT_AGENT}\n`),
+  encodePktLine('ls-refs=unborn\n'),
+  encodePktLine('fetch=shallow filter\n'),
+  encodePktLine('object-format=sha1\n'),
+  FLUSH,
+]);
 
 function advertisementV0(repo: Repo, service: string): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS(repo.defaultBranch) : RECEIVE_CAPS(repo.defaultBranch);
@@ -188,6 +191,51 @@ interface Selection {
   objects: Map<string, GitObject>;
   shallow: string[];
   unshallow: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Fetch response cache
+// ---------------------------------------------------------------------------
+
+const FETCH_CACHE_MAX_ENTRIES = 64;
+const FETCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const FETCH_CACHE_MAX_ENTRY_BYTES = 256 * 1024;
+
+function fetchCacheKey(protocol: string, req: FetchRequest): string {
+  return `${protocol}|${req.wants.join(',')}|${req.haves.join(',')}|${req.shallow.join(',')}|${req.depth ?? ''}`;
+}
+
+/** A fetch result is cacheable only when every oid the request names
+ *  already exists in the store: the walk then depends solely on
+ *  content-addressed, immutable objects, so the reply is byte-identical
+ *  forever. A request naming a missing oid is computed fresh every time
+ *  (its result could change once that object arrives). */
+function fetchCacheable(repo: Repo, req: FetchRequest): boolean {
+  for (const oid of [...req.wants, ...req.haves, ...req.shallow]) {
+    if (!repo.objects.has(oid)) return false;
+  }
+  return true;
+}
+
+function fetchCached(repo: Repo, protocol: string, req: FetchRequest): Buffer | null {
+  return repo.fetchCache.get(fetchCacheKey(protocol, req)) ?? null;
+}
+
+function fetchCacheStore(repo: Repo, protocol: string, req: FetchRequest, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_ENTRY_BYTES) return;
+  if (!fetchCacheable(repo, req)) return;
+  const key = fetchCacheKey(protocol, req);
+  const prev = repo.fetchCache.get(key);
+  if (prev) repo.fetchCacheBytes -= prev.length;
+  if (
+    repo.fetchCache.size >= FETCH_CACHE_MAX_ENTRIES ||
+    repo.fetchCacheBytes + body.length > FETCH_CACHE_MAX_BYTES
+  ) {
+    repo.fetchCache.clear();
+    repo.fetchCacheBytes = 0;
+  }
+  repo.fetchCache.set(key, body);
+  repo.fetchCacheBytes += body.length;
 }
 
 function selectObjects(repo: Repo, req: FetchRequest): Selection {
@@ -422,8 +470,12 @@ function handleUploadPack(repo: Repo, body: Buffer, gitProtocol: string): GitRes
           if (!Number.isNaN(n)) req.depth = n;
         }
       }
+      const cached = fetchCached(repo, 'v2', req);
+      if (cached) return { status: 200, contentType: ct, body: cached };
       const sel = selectObjects(repo, req);
-      return { status: 200, contentType: ct, body: fetchResponseV2(sel) };
+      const body = fetchResponseV2(sel);
+      fetchCacheStore(repo, 'v2', req, body);
+      return { status: 200, contentType: ct, body };
     }
     return textResponse(400, `Unknown command: ${parsed.command}`);
   }
@@ -434,8 +486,12 @@ function handleUploadPack(repo: Repo, body: Buffer, gitProtocol: string): GitRes
   } catch (e) {
     return textResponse(400, `Malformed request: ${(e as Error).message}`);
   }
+  const cached = fetchCached(repo, 'v0', req);
+  if (cached) return { status: 200, contentType: ct, body: cached };
   const sel = selectObjects(repo, req);
-  return { status: 200, contentType: ct, body: fetchResponseV0(sel) };
+  const resBody = fetchResponseV0(sel);
+  fetchCacheStore(repo, 'v0', req, resBody);
+  return { status: 200, contentType: ct, body: resBody };
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +511,8 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitResponse 
   let packBytes = Buffer.alloc(0);
   try {
     const { packets, restOffset } = decodePktLinesUntilFlush(body);
-    packBytes = Buffer.from(body.subarray(restOffset));
+    // readPack only reads the pack; no copy of the bytes is needed.
+    packBytes = body.subarray(restOffset);
     for (const p of packets) {
       if (p.kind !== 'data') continue;
       let line = p.data.toString('utf8');

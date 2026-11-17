@@ -263,7 +263,10 @@ export function decodeSideband(buf: Buffer): Map<number, Buffer> {
 // Pack write / read
 // ---------------------------------------------------------------------------
 
-/** Write a pack (version 2, plain objects only, no deltas). */
+/** Write a pack (version 2, plain objects only, no deltas). Deflate level 1:
+ *  a fetch pack is wire data, never part of the deterministic state export,
+ *  and any valid zlib stream inflates the same objects; level 1 spends far
+ *  less CPU than the default for the small objects a fetch sends. */
 export function writePack(entries: Array<{ oid: string; type: ObjType; data: Buffer }>): Buffer {
   const chunks: Buffer[] = [];
   const header = Buffer.alloc(12);
@@ -273,7 +276,7 @@ export function writePack(entries: Array<{ oid: string; type: ObjType; data: Buf
   chunks.push(header);
   for (const e of entries) {
     const typeNum = TYPE_NUM[e.type];
-    const deflated = deflateSync(e.data);
+    const deflated = deflateSync(e.data, { level: 1 });
     let size = e.data.length;
     const first = (size & 0x0f) | (typeNum << 4);
     size >>= 4;
@@ -291,23 +294,33 @@ export function writePack(entries: Array<{ oid: string; type: ObjType; data: Buf
   return Buffer.concat([body, trailer]);
 }
 
-/** Adler-32 checksum (the trailer of every zlib stream). */
+/** Adler-32 checksum (the trailer of every zlib stream). The running sums
+ *  only need a modulo every 5552 bytes (the largest block that cannot
+ *  overflow a 32-bit accumulator), so a single pass defers the modulos
+ *  instead of paying two per byte. */
 function adler32(data: Buffer): number {
   let a = 1;
   let b = 0;
-  for (let i = 0; i < data.length; i++) {
-    a = (a + data[i]) % 65521;
-    b = (b + a) % 65521;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(data.length, i + 5552);
+    for (; i < end; i++) {
+      a += data[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
   }
   return ((b << 16) | a) >>> 0;
 }
 
 /** Find the length of the deflate stream starting at `off` in buf, knowing
- *  its inflated size. inflateSync ignores trailing bytes, so one call
- *  inflates the first stream; the stream's end is the position of its
- *  Adler-32 trailer (verified by re-inflating the exact slice). This costs
- *  two inflateSync calls per object instead of a binary search's ~eleven. */
-function findDeflateEnd(buf: Buffer, off: number, inflatedSize: number): number {
+ *  its inflated size, and return the inflated data with it. inflateSync
+ *  ignores trailing bytes, so one call inflates the first stream; the
+ *  stream's end is the position of its Adler-32 trailer (verified by
+ *  re-inflating the exact slice). Returning the data with the length
+ *  avoids a third inflate of the same stream by the caller. */
+function findDeflateEnd(buf: Buffer, off: number, inflatedSize: number): { length: number; data: Buffer } {
   const data = inflateSync(buf.subarray(off));
   if (data.length !== inflatedSize) throw new Error('pack object size mismatch');
   const needle = Buffer.alloc(4);
@@ -321,7 +334,7 @@ function findDeflateEnd(buf: Buffer, off: number, inflatedSize: number): number 
     if (len >= 7) {
       try {
         const check = inflateSync(buf.subarray(off, off + len));
-        if (check.length === inflatedSize) return len;
+        if (check.length === inflatedSize) return { length: len, data };
       } catch {
         // Not the true end (a coincidental match inside the deflate data).
       }
@@ -421,8 +434,7 @@ export function readPack(buf: Buffer, known?: Map<string, GitObject>): Map<strin
     } else if (!(typeNum in NUM_TYPE)) {
       throw new Error(`unknown pack object type ${typeNum}`);
     }
-    const streamLen = findDeflateEnd(buf, off, size);
-    const data = inflateSync(buf.subarray(off, off + streamLen));
+    const { length: streamLen, data } = findDeflateEnd(buf, off, size);
     if (data.length !== size) throw new Error('pack object size mismatch');
     off += streamLen;
     if (typeNum === 6 || typeNum === 7) {

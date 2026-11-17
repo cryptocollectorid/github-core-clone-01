@@ -86,6 +86,13 @@ export interface Repo {
   pulls: Map<number, Pull>;
   nextPullNumber: number;
   labels: Map<string, Label>;
+  /** Memoized fetch responses (the whole upload-pack reply Buffer), keyed
+   *  by the fetch request. A fetch result is a pure function of the objects
+   *  it walks (content-addressed and immutable) plus the request, so a
+   *  cached reply is byte-identical to a fresh one; entries are only made
+   *  when every oid the request names already exists in the store. */
+  fetchCache: Map<string, Buffer>;
+  fetchCacheBytes: number;
 }
 
 export class Store {
@@ -137,6 +144,8 @@ export class Store {
       pulls: new Map(),
       nextPullNumber: 1,
       labels: new Map(),
+      fetchCache: new Map(),
+      fetchCacheBytes: 0,
     };
     this.repos.set(key, repo);
     return repo;
